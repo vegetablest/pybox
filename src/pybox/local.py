@@ -44,18 +44,10 @@ class LocalPyBox(BasePyBox):
                     continue
                 # See <https://jupyter-client.readthedocs.io/en/latest/messaging.html#execution-results>
                 # error execution may have extra messages, for example a stream std error
-                response = ExecutionResponse.model_validate(shell_msg)
-                if response.content.status == "error":
-                    raise CodeExecutionError(
-                        ename=response.content.ename,
-                        evalue=response.content.evalue,
-                        traceback=response.content.traceback,
-                    )
+                return ExecutionResponse.model_validate(shell_msg)
             except queue.Empty:
-                logger.warning("No shell message received.")
-                return None
-            else:
-                return response
+                self.__interrupt_kernel()
+                break
 
     def __get_kernel_output(self, msg_id: str, **kwargs) -> PyBoxOut | None:
         """Retrieves output from a kernel.
@@ -70,6 +62,7 @@ class LocalPyBox(BasePyBox):
             CodeExecutionException: if the code execution fails
         """
         result = None
+        error = None
         while True:
             # Poll the message
             try:
@@ -94,10 +87,19 @@ class LocalPyBox(BasePyBox):
                     # See <https://jupyter-client.readthedocs.io/en/stable/messaging.html#streams-stdout-stderr-etc>
                     if not result:
                         result = PyBoxOut(data={"text/plain": response.content.text})
+                elif response.msg_type == "error":
+                    error = CodeExecutionError(
+                        ename=response.content.ename,
+                        evalue=response.content.evalue,
+                        traceback=response.content.traceback,
+                    )
+
                 elif response.msg_type == "status":  # noqa: SIM102
                     # According to the document <https://jupyter-client.readthedocs.io/en/latest/messaging.html#request-reply>
                     # The idle message will be published after processing the request and publishing associated IOPub messages
                     if response.content.execution_state == "idle":
+                        if error is not None:
+                            raise error
                         break
             except queue.Empty:
                 logger.warning("No iopub message received.")
@@ -122,18 +124,10 @@ class LocalPyBox(BasePyBox):
                     continue
                 # See <https://jupyter-client.readthedocs.io/en/latest/messaging.html#execution-results>
                 # error execution may have extra messages, for example a stream std error
-                response = ExecutionResponse.model_validate(shell_msg)
-                if response.content.status == "error":
-                    raise CodeExecutionError(
-                        ename=response.content.ename,
-                        evalue=response.content.evalue,
-                        traceback=response.content.traceback,
-                    )
+                return ExecutionResponse.model_validate(shell_msg)
             except queue.Empty:
-                logger.warning("No shell message received.")
-                return None
-            else:
-                return response
+                self.__interrupt_kernel()
+                break
 
     async def __aget_kernel_output(self, msg_id: str, **kwargs) -> PyBoxOut | None:
         """Retrieves output from a kernel asynchronously.
@@ -148,6 +142,7 @@ class LocalPyBox(BasePyBox):
             CodeExecutionException: if the code execution fails
         """
         result = None
+        error = None
         while True:
             # Poll the message
             try:
@@ -174,15 +169,41 @@ class LocalPyBox(BasePyBox):
                     # See <https://jupyter-client.readthedocs.io/en/stable/messaging.html#streams-stdout-stderr-etc>
                     if not result:
                         result = PyBoxOut(data={"text/plain": response.content.text})
+                elif response.msg_type == "error":
+                    error = CodeExecutionError(
+                        ename=response.content.ename,
+                        evalue=response.content.evalue,
+                        traceback=response.content.traceback,
+                    )
                 elif response.msg_type == "status":  # noqa: SIM102
                     # According to the document <https://jupyter-client.readthedocs.io/en/latest/messaging.html#request-reply>
                     # The idle message will be published after processing the request and publishing associated IOPub messages
                     if response.content.execution_state == "idle":
+                        if error is not None:
+                            raise error
                         break
             except queue.Empty:
                 logger.warning("No iopub message received.")
                 break
         return result
+
+    def __interrupt_kernel(self) -> None:
+        """send an interrupt message to the kernel."""
+        try:
+            interrupt_msg = self.client.session.msg("interrupt_request", content={})
+            self.client.control_channel.send(interrupt_msg)
+            control_msg = self.client.get_control_msg(timeout=5)
+            # TODO: Do you need to determine whether the parent id is equal to the interrupt message id?
+            # See <https://jupyter-client.readthedocs.io/en/latest/messaging.html#kernel-interrupt>
+            if control_msg["msg_type"] == "interrupt_reply":
+                status = control_msg["content"]["status"]
+                if status == "ok":
+                    logger.info("Kernel %s interrupt signal sent successfully.", self.kernel_id)
+                else:
+                    logger.warning("Kernel %s interrupt signal sent failed: %s", self.kernel_id, status)
+        except Exception as e:  # noqa: BLE001
+            # TODO: What should I do if sending an interrupt message times out or fails?
+            logger.warning("Failed to send interrupt message to kernel %s: %s", self.kernel_id, e)
 
 
 class LocalPyBoxManager(BasePyBoxManager):
